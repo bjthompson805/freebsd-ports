@@ -1,0 +1,100 @@
+M5 (Apple T8142) FreeBSD: CPU copy into a dumb buffer when PRIME import into the Apple
+display driver fails; renderer on the allocator FD when the session has no render node.
+
+--- include/aquamarine/backend/Backend.hpp.orig
++++ include/aquamarine/backend/Backend.hpp
+@@ -37,6 +37,7 @@ namespace Aquamarine {
+         AQ_BACKEND_GPU_DRIVER_NVIDIA,  // proprietary nvidia-drm
+         AQ_BACKEND_GPU_DRIVER_NOUVEAU, // open source nouveau
+         AQ_BACKEND_GPU_DRIVER_EVDI,    // displayLink virtual driver
++        AQ_BACKEND_GPU_DRIVER_APPLE,   // Apple display controller
+     };
+
+     enum eBackendRequestMode : uint32_t {
+--- src/backend/drm/DRM.cpp.orig
++++ src/backend/drm/DRM.cpp
+@@ -877,7 +877,8 @@ bool Aquamarine::CDRMBackend::initMgpu() {
+         return false;
+     }
+
+-    rendererState.renderer = CDRMRenderer::attempt(backend.lock(), gpu->renderNodeFd >= 0 ? gpu->renderNodeFd : gpu->fd);
++    rendererState.renderer = CDRMRenderer::attempt(backend.lock(),
++                                                   gpu->renderNodeFd >= 0 ? gpu->renderNodeFd : rendererState.allocator->drmFD());
+
+     if (!rendererState.renderer) {
+         backend->log(AQ_LOG_ERROR, "drm: initMgpu: no renderer");
+@@ -1108,6 +1109,8 @@ bool Aquamarine::CDRMBackend::registerGPU(SP<CSessionDevice> gpu_, SP<CDRMBacken
+             return AQ_BACKEND_GPU_DRIVER_NVIDIA;
+         if (name == "nouveau")
+             return AQ_BACKEND_GPU_DRIVER_NOUVEAU;
++        if (name == "apple")
++            return AQ_BACKEND_GPU_DRIVER_APPLE;
+         if (name == "evdi")
+             return AQ_BACKEND_GPU_DRIVER_EVDI;
+
+@@ -1542,7 +1545,7 @@ void Aquamarine::CDRMBackend::onReady() {
+         if (!a)
+             backend->log(AQ_LOG_ERROR, "drm: onReady: no renderer for gl formats");
+         else {
+-            auto r = CDRMRenderer::attempt(backend.lock(), gpu->renderNodeFd >= 0 ? gpu->renderNodeFd : gpu->fd);
++            auto r = CDRMRenderer::attempt(backend.lock(), gpu->renderNodeFd >= 0 ? gpu->renderNodeFd : a->drmFD());
+             if (!r)
+                 backend->log(AQ_LOG_ERROR, "drm: onReady: no renderer for gl formats");
+             else {
+@@ -2469,7 +2472,7 @@ bool Aquamarine::CDRMOutput::prepareAsyncCommitData(const COutputState::CSnapsho
+     } else
+         drmFB = CDRMFB::create(STATE.buffer, backend, nullptr);
+
+-    if (!drmFB && backend->driver == AQ_BACKEND_GPU_DRIVER_EVDI) {
++    if (!drmFB && (backend->driver == AQ_BACKEND_GPU_DRIVER_EVDI || backend->driver == AQ_BACKEND_GPU_DRIVER_APPLE)) {
+         requiresSync = true;
+         return false;
+     }
+@@ -2714,21 +2717,24 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
+
+             drmFB = CDRMFB::create(NEWAQBUF, backend, nullptr); // will return attachment if present
+         } else {
+-            const bool EVDI = backend->driver == AQ_BACKEND_GPU_DRIVER_EVDI;
++            const bool copyOnImportFailure =
++                backend->driver == AQ_BACKEND_GPU_DRIVER_EVDI || backend->driver == AQ_BACKEND_GPU_DRIVER_APPLE;
+
+-            if (!(EVDI && backend->cpuCopyFallback))
++            if (!(copyOnImportFailure && backend->cpuCopyFallback))
+                 drmFB = CDRMFB::create(STATE.buffer, backend, nullptr); // will return attachment if present
+
+-            if (!drmFB && EVDI && backend->dumbAllocator) {
++            if (!drmFB && copyOnImportFailure && backend->dumbAllocator) {
+                 if (!backend->cpuCopyFallback) {
+                     backend->backend->log(AQ_LOG_DEBUG,
+                                           std::format("drm: direct KMS import of primary buffer failed on {}, switching to dumb-buffer CPU copy", backend->gpuName));
+                     backend->cpuCopyFallback = true;
+                 }
+
+-                SP<CDRMRenderer> primaryRenderer = backend->primary ? backend->primary->rendererState.renderer : nullptr;
++                if (!backend->primary && !backend->rendererState.renderer && !backend->initMgpu())
++                    return false;
++                SP<CDRMRenderer> primaryRenderer = backend->primary ? backend->primary->rendererState.renderer : backend->rendererState.renderer;
+                 if (!primaryRenderer) {
+-                    backend->backend->log(AQ_LOG_ERROR, "drm: evdi CPU copy requires a primary renderer");
++                    backend->backend->log(AQ_LOG_ERROR, "drm: CPU copy requires a primary renderer");
+                     return false;
+                 }
+
+@@ -2739,7 +2745,7 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
+                 auto blitResult = primaryRenderer->blit(STATE.buffer, NEWAQBUF, nullptr,
+                                                         (COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE) ? STATE.explicitInFence : -1);
+                 if (!blitResult.success) {
+-                    backend->backend->log(AQ_LOG_ERROR, "drm: evdi: primary blit into dumb buffer failed");
++                    backend->backend->log(AQ_LOG_ERROR, "drm: primary blit into dumb buffer failed");
+                     return false;
+                 }
+
+@@ -3366,7 +3372,7 @@ void Aquamarine::CDRMFB::import() {
+     for (int i = 0; i < attrs.planes; ++i) {
+         int ret = drmPrimeFDToHandle(backend->gpu->fd, attrs.fds.at(i), &boHandles[i]);
+         if (ret) {
+-            backend->backend->log(AQ_LOG_ERROR, "drm: drmPrimeFDToHandle failed");
++            backend->backend->log(AQ_LOG_ERROR, std::format("drm: drmPrimeFDToHandle failed: {}", strerror(errno)));
+             drop();
+             return;
+         }
