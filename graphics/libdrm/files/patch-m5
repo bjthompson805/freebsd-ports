@@ -1,0 +1,121 @@
+M5 (Apple T8142) FreeBSD: platform DRM devices. drm-kmod reports "platform:<name>" in
+hw.dri.N.busid for devices without a PCI address (Apple DCP display, AGX GPU); parse
+it as DRM_BUS_PLATFORM instead of looking the device up on /dev/pci.
+
+--- xf86drm.c.orig
++++ xf86drm.c
+@@ -3616,6 +3616,10 @@
+ 
+     return -EINVAL;
+ }
++#endif
++
++#ifdef __FreeBSD__
++static int get_sysctl_busid(int maj, int min, char *busid, size_t len);
+ #endif
+ 
+ static int drmParseSubsystemType(int maj, int min)
+@@ -3639,8 +3643,16 @@
+             return DRM_BUS_VIRTIO;
+      }
+     return subsystem_type;
+-#elif defined(__OpenBSD__) || defined(__DragonFly__) || defined(__FreeBSD__)
++#elif defined(__FreeBSD__)
++    char busid[256];
++
++    /* drm-kmod reports "platform:<name>" for devices without a PCI address */
++    if (get_sysctl_busid(maj, min, busid, sizeof(busid)) == 0 &&
++        strncmp(busid, "platform:", 9) == 0)
++        return DRM_BUS_PLATFORM;
+     return DRM_BUS_PCI;
++#elif defined(__OpenBSD__) || defined(__DragonFly__)
++    return DRM_BUS_PCI;
+ #else
+ #warning "Missing implementation of drmParseSubsystemType"
+     return -EINVAL;
+@@ -3666,14 +3678,12 @@
+ #endif
+ 
+ #ifdef __FreeBSD__
+-static int get_sysctl_pci_bus_info(int maj, int min, drmPciBusInfoPtr info)
++static int get_sysctl_busid(int maj, int min, char *busid, size_t len)
+ {
+     char dname[SPECNAMELEN];
+     char sysctl_name[16];
+-    char sysctl_val[256];
+-    size_t sysctl_len;
+-    int id, type, nelem;
+-    unsigned int rdev, majmin, domain, bus, dev, func;
++    int id, type;
++    unsigned int rdev;
+ 
+     rdev = makedev(maj, min);
+     if (!devname_r(rdev, S_IFCHR, dname, sizeof(dname)))
+@@ -3704,8 +3714,19 @@
+ 
+     if (snprintf(sysctl_name, sizeof(sysctl_name), "hw.dri.%d.busid", id) <= 0)
+       return -EINVAL;
+-    sysctl_len = sizeof(sysctl_val);
+-    if (sysctlbyname(sysctl_name, sysctl_val, &sysctl_len, NULL, 0))
++    if (sysctlbyname(sysctl_name, busid, &len, NULL, 0))
++      return -EINVAL;
++
++    return 0;
++}
++
++static int get_sysctl_pci_bus_info(int maj, int min, drmPciBusInfoPtr info)
++{
++    char sysctl_val[256];
++    int nelem;
++    unsigned int domain, bus, dev, func;
++
++    if (get_sysctl_busid(maj, min, sysctl_val, sizeof(sysctl_val)))
+       return -EINVAL;
+ 
+     #define bus_fmt "pci:%04x:%02x:%02x.%u"
+@@ -4317,7 +4338,18 @@
+     strncpy(fullname, tmp_name, DRM_PLATFORM_DEVICE_NAME_LEN);
+     fullname[DRM_PLATFORM_DEVICE_NAME_LEN - 1] = '\0';
+     free(name);
++
++    return 0;
++#elif defined(__FreeBSD__)
++    char busid[256];
++
++    if (get_sysctl_busid(maj, min, busid, sizeof(busid)) != 0 ||
++        strncmp(busid, "platform:", 9) != 0)
++        return -ENOENT;
+ 
++    strncpy(fullname, busid + 9, DRM_PLATFORM_DEVICE_NAME_LEN);
++    fullname[DRM_PLATFORM_DEVICE_NAME_LEN - 1] = '\0';
++
+     return 0;
+ #else
+ #warning "Missing implementation of drmParseOFBusInfo"
+@@ -4379,6 +4411,26 @@
+ 
+     free(*compatible);
+     return err;
++#elif defined(__FreeBSD__)
++    char fullname[DRM_PLATFORM_DEVICE_NAME_LEN];
++    int err;
++
++    /* No OF compatible list in the sysctl; use the device name, as Linux
++     * does with MODALIAS for devices that lack OF data. */
++    err = drmParseOFBusInfo(maj, min, fullname);
++    if (err)
++        return err;
++
++    *compatible = calloc(2, sizeof(char *));
++    if (!*compatible)
++        return -ENOMEM;
++    (*compatible)[0] = strdup(fullname);
++    if (!(*compatible)[0]) {
++        free(*compatible);
++        return -ENOMEM;
++    }
++
++    return 0;
+ #else
+ #warning "Missing implementation of drmParseOFDeviceInfo"
+     return -EINVAL;
